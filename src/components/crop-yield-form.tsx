@@ -1,0 +1,585 @@
+
+'use client';
+
+import type { EstimateCropYieldOutput } from '@/ai/flows/estimate-crop-yield';
+import type { SuggestCropOutput } from '@/ai/flows/suggest-suitable-crop';
+import { handleEstimateCropYield, handleSuggestCrop } from '@/lib/actions';
+import { DEFAULT_CROP_OPTIONS, SOIL_PROPERTIES_CONFIG, GENERAL_CROP_ICON, type SoilPropertyConfig } from '@/lib/constants';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Check, ChevronsUpDown, Loader2, BarChart3, Square, Leaf, DollarSign, Info, Lightbulb, Beaker, Image as ImageIcon, X, Sparkles } from 'lucide-react';
+import Image from 'next/image';
+import { useEffect, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { z } from 'zod';
+
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { Input } from '@/components/ui/input';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Slider } from '@/components/ui/slider';
+import { Textarea } from '@/components/ui/textarea';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
+import { useToast } from '@/hooks/use-toast';
+import { cn } from '@/lib/utils';
+import { Separator } from './ui/separator';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+
+const formSchemaObject = {
+  cropType: z.string().min(1, 'Crop type is required.'),
+  plotSize: z.coerce.number().min(0.01, "Plot size must be at least 0.01 acres."),
+  photoDataUri: z.string().optional(),
+  ...Object.fromEntries(
+    SOIL_PROPERTIES_CONFIG.map((prop) => [
+      prop.id,
+      prop.type === 'number'
+        ? z.coerce.number().min(prop.min ?? -Infinity).max(prop.max ?? Infinity).optional()
+        : z.string().optional(),
+    ])
+  ),
+};
+
+const FormSchema = z.object(formSchemaObject);
+type CropYieldFormData = z.infer<typeof FormSchema>;
+
+export function CropYieldForm() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSuggesting, setIsSuggesting] = useState(false);
+  const [estimationResult, setEstimationResult] = useState<EstimateCropYieldOutput | null>(null);
+  const [comboboxOpen, setComboboxOpen] = useState(false);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<SuggestCropOutput | null>(null);
+  const [isSuggestionDialogOpen, setIsSuggestionDialogOpen] = useState(false);
+  const { toast } = useToast();
+
+  // Location state sourced from data.gov.in
+  const [states, setStates] = useState<string[]>([]);
+  const [districts, setDistricts] = useState<string[]>([]);
+  const [markets, setMarkets] = useState<string[]>([]);
+  const [availableCrops, setAvailableCrops] = useState<string[]>([]);
+
+  const [selectedState, setSelectedState] = useState<string>('');
+  const [selectedDistrict, setSelectedDistrict] = useState<string>('');
+  const [selectedMarket, setSelectedMarket] = useState<string>('');
+  const [districtsLoading, setDistrictsLoading] = useState(false);
+  const [marketsLoading, setMarketsLoading] = useState(false);
+
+  const FALLBACK_STATES = [
+    'Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chhattisgarh','Goa','Gujarat','Haryana','Himachal Pradesh','Jharkhand','Karnataka','Kerala','Madhya Pradesh','Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Punjab','Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh','Uttarakhand','West Bengal','Andaman and Nicobar Islands','Chandigarh','Dadra and Nagar Haveli and Daman and Diu','Delhi','Jammu and Kashmir','Ladakh','Lakshadweep','Puducherry'
+  ];
+
+  const form = useForm<CropYieldFormData>({
+    resolver: zodResolver(FormSchema),
+    defaultValues: {
+      cropType: '',
+      plotSize: 2, // Default plot size
+      photoDataUri: undefined,
+      ...Object.fromEntries(SOIL_PROPERTIES_CONFIG.map((prop) => [prop.id, prop.defaultValue])),
+    },
+  });
+
+  // Helper to call our API routes
+  async function fetchJson<T>(url: string): Promise<T | null> {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data as T;
+    } catch {
+      return null;
+    }
+  }
+
+  // Load states on mount
+  useEffect(() => {
+    (async () => {
+      const res = await fetchJson<{ success: boolean; data?: string[] }>(`/api/locations/states`);
+      if (res?.success && res.data && res.data.length > 0) setStates(res.data);
+      else setStates(FALLBACK_STATES);
+    })();
+  }, []);
+
+  // When state changes, load districts and crops; markets load after district is selected
+  useEffect(() => {
+    if (!selectedState) {
+      setDistricts([]);
+      setMarkets([]);
+      setAvailableCrops([]);
+      setSelectedDistrict('');
+      setSelectedMarket('');
+      return;
+    }
+    (async () => {
+      setDistrictsLoading(true);
+      const [dRes, cRes] = await Promise.all([
+        fetchJson<{ success: boolean; data?: string[] }>(`/api/locations/districts?state=${encodeURIComponent(selectedState)}`),
+        fetchJson<{ success: boolean; data?: string[] }>(`/api/commodities?state=${encodeURIComponent(selectedState)}`),
+      ]);
+      setDistricts(dRes?.success && dRes.data ? dRes.data : []);
+      setMarkets([]);
+      setAvailableCrops(cRes?.success && cRes.data ? cRes.data : []);
+      setSelectedDistrict('');
+      setSelectedMarket('');
+      setDistrictsLoading(false);
+    })();
+  }, [selectedState]);
+
+  // When district changes, narrow markets and crops
+  useEffect(() => {
+    if (!selectedState) return;
+    (async () => {
+      setMarketsLoading(true);
+      const [mRes, cRes] = await Promise.all([
+        fetchJson<{ success: boolean; data?: string[] }>(`/api/locations/markets?state=${encodeURIComponent(selectedState)}${selectedDistrict ? `&district=${encodeURIComponent(selectedDistrict)}` : ''}`),
+        fetchJson<{ success: boolean; data?: string[] }>(`/api/commodities?state=${encodeURIComponent(selectedState)}${selectedDistrict ? `&district=${encodeURIComponent(selectedDistrict)}` : ''}`),
+      ]);
+      if (mRes?.success && mRes.data) setMarkets(mRes.data); else setMarkets([]);
+      if (cRes?.success && cRes.data) setAvailableCrops(cRes.data);
+      setSelectedMarket('');
+      setMarketsLoading(false);
+    })();
+  }, [selectedDistrict, selectedState]);
+
+  // When market changes, narrow crops
+  useEffect(() => {
+    if (!selectedState) return;
+    (async () => {
+      const cRes = await fetchJson<{ success: boolean; data?: string[] }>(`/api/commodities?state=${encodeURIComponent(selectedState)}${selectedDistrict ? `&district=${encodeURIComponent(selectedDistrict)}` : ''}${selectedMarket ? `&market=${encodeURIComponent(selectedMarket)}` : ''}`);
+      if (cRes?.success && cRes.data) setAvailableCrops(cRes.data);
+    })();
+  }, [selectedMarket, selectedState, selectedDistrict]);
+  
+  const handleImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const dataUri = reader.result as string;
+        setImagePreview(dataUri);
+        form.setValue('photoDataUri', dataUri);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const clearImage = () => {
+    setImagePreview(null);
+    form.setValue('photoDataUri', undefined);
+    // Reset the file input value
+    const fileInput = document.getElementById('photo-upload') as HTMLInputElement;
+    if (fileInput) {
+      fileInput.value = '';
+    }
+  };
+
+  async function onSuggest() {
+    setIsSuggesting(true);
+    const formData = form.getValues();
+    const { cropType, plotSize, photoDataUri, ...rest } = formData as any;
+    const result = await handleSuggestCrop(rest as any);
+    setIsSuggesting(false);
+
+    if (result.success && result.data) {
+      setSuggestions(result.data);
+      setIsSuggestionDialogOpen(true);
+    } else {
+      toast({
+        title: 'Suggestion Failed',
+        description: result.error || 'Could not suggest crops for the given conditions.',
+        variant: 'destructive',
+      });
+    }
+  }
+
+  async function onSubmit(data: CropYieldFormData) {
+    setIsLoading(true);
+    setEstimationResult(null);
+    
+    const result = await handleEstimateCropYield(data);
+    setIsLoading(false);
+
+    if (result.success && result.data) {
+      setEstimationResult(result.data);
+      toast({
+        title: 'Estimation Successful',
+        description: `Yield and value for ${data.cropType} on ${data.plotSize} acres estimated.`,
+      });
+    } else {
+      toast({
+        title: 'Estimation Failed',
+        description: result.error || 'An unknown error occurred.',
+        variant: 'destructive',
+      });
+    }
+  }
+
+  const currentPlotSize = form.watch('plotSize');
+  const selectedCropLabel = form.watch('cropType');
+  const SelectedCropIcon = DEFAULT_CROP_OPTIONS.find(c => c.value === selectedCropLabel || c.label === selectedCropLabel)?.icon || GENERAL_CROP_ICON;
+
+  const dynamicCropOptions = availableCrops.length > 0
+    ? availableCrops.map((label) => ({ label, value: label }))
+    : DEFAULT_CROP_OPTIONS;
+
+  // Debug section to show current state
+  
+
+  return (
+    <div className="container mx-auto py-8 px-4 md:px-0">
+      <Card className="max-w-4xl mx-auto shadow-xl">
+        <CardHeader className="text-center">
+          <div className="flex items-center justify-center mb-2">
+            <div>
+              <CardTitle className="text-3xl font-bold text-primary">CropPredict</CardTitle>
+              <CardDescription className="text-lg">AI-Powered Crop Yield & Value Estimator for India</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <Form {...form}>
+            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-xl text-primary flex items-center"><Info className="mr-2 h-5 w-5" />Location</CardTitle>
+                  <CardDescription>Select your State, then District and Market to load local commodities.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <FormLabel className="font-semibold text-lg mb-1">State</FormLabel>
+                      <Select value={selectedState} onValueChange={(v) => setSelectedState(v.trim())}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select state" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {states.map((s) => (
+                            <SelectItem key={s} value={s}>{s}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div>
+                      <FormLabel className="font-semibold text-lg mb-1">District</FormLabel>
+                      <Select value={selectedDistrict} onValueChange={(v) => setSelectedDistrict(v.trim())} disabled={!selectedState || districtsLoading}>
+                        <SelectTrigger>
+                          <SelectValue placeholder={districtsLoading ? 'Loading districts...' : 'Select district'} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {districtsLoading && <SelectItem disabled value="__loading">Loading...</SelectItem>}
+                          {!districtsLoading && districts.length === 0 && <SelectItem disabled value="__none">No districts found</SelectItem>}
+                          {!districtsLoading && districts.map((d) => (
+                            <SelectItem key={d} value={d}>{d}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div>
+                      <FormLabel className="font-semibold text-lg mb-1">Market</FormLabel>
+                      <Select value={selectedMarket} onValueChange={(v) => setSelectedMarket(v.trim())} disabled={!selectedState || !selectedDistrict || marketsLoading}>
+                        <SelectTrigger>
+                          <SelectValue placeholder={!selectedDistrict ? 'Select district first' : (marketsLoading ? 'Loading markets...' : 'Select market')} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {marketsLoading && <SelectItem disabled value="__loading">Loading...</SelectItem>}
+                          {!marketsLoading && markets.length === 0 && <SelectItem disabled value="__none">No markets found</SelectItem>}
+                          {!marketsLoading && markets.map((m) => (
+                            <SelectItem key={m} value={m}>{m}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+                <FormField
+                  control={form.control}
+                  name="cropType"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-col">
+                      <FormLabel className="font-semibold text-lg mb-1">Select or Enter Crop Type</FormLabel>
+                      <Popover open={comboboxOpen} onOpenChange={setComboboxOpen}>
+                        <PopoverTrigger asChild>
+                          <FormControl>
+                            <Button
+                              variant="outline"
+                              role="combobox"
+                              className={cn(
+                                'w-full justify-between',
+                                !field.value && 'text-muted-foreground'
+                              )}
+                            >
+                              {field.value
+                                ? DEFAULT_CROP_OPTIONS.find(
+                                    (crop) => crop.value === field.value || crop.label.toLowerCase() === field.value.toLowerCase()
+                                  )?.label || field.value
+                                : 'Select crop...'}
+                              <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                            </Button>
+                          </FormControl>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-[--radix-popover-trigger-width] p-0">
+                          <Command>
+                            <CommandInput 
+                              placeholder="Search crop or type custom..."
+                              onValueChange={(currentValue) => {
+                                  // The user can type a custom value, so we just pass it up.
+                                  field.onChange(currentValue);
+                              }}
+                            />
+                              <CommandList>
+                              <CommandEmpty>No crop found. Type to add custom.</CommandEmpty>
+                              <CommandGroup>
+                                {dynamicCropOptions.map((crop) => (
+                                  <CommandItem
+                                    value={crop.label}
+                                    key={crop.value}
+                                    onSelect={() => {
+                                      form.setValue('cropType', crop.label);
+                                      setComboboxOpen(false);
+                                    }}
+                                  >
+                                    <Check
+                                      className={cn(
+                                        'mr-2 h-4 w-4',
+                                        crop.label === field.value || crop.value === field.value ? 'opacity-100' : 'opacity-0'
+                                      )}
+                                    />
+                                    {crop.label}
+                                  </CommandItem>
+                                ))}
+                              </CommandGroup>
+                            </CommandList>
+                          </Command>
+                        </PopoverContent>
+                      </Popover>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                 <FormField
+                  control={form.control}
+                  name="plotSize"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-col">
+                      <FormLabel className="font-semibold text-lg mb-1 flex items-center">
+                        <Square className="mr-2 h-5 w-5 text-primary" />
+                        Plot Size (acres)
+                      </FormLabel>
+                      <FormControl>
+                        <Input type="number" step="0.1" {...field} 
+                         onChange={(e) => {
+                            const val = parseFloat(e.target.value);
+                            field.onChange(isNaN(val) ? undefined : val);
+                         }}
+                         value={field.value === undefined || isNaN(field.value as number) ? '' : field.value}
+                        />
+                      </FormControl>
+                       <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-xl text-primary flex items-center"><Beaker className="mr-2 h-5 w-5" />Soil & Environmental Properties</CardTitle>
+                  <CardDescription>Adjust the sliders or enter values directly for each property. These are optional.</CardDescription>
+                </CardHeader>
+                <CardContent className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-6">
+                  {SOIL_PROPERTIES_CONFIG.map((prop: SoilPropertyConfig) => (
+                    <FormField
+                      key={prop.id}
+                      control={form.control}
+                      name={prop.id as keyof CropYieldFormData}
+                      render={({ field }) => {
+                        const IconComponent = prop.icon;
+                        const numericValue = typeof field.value === 'string' ? parseFloat(field.value) : (field.value as number);
+
+                        return (
+                          <FormItem>
+                            <FormLabel className="flex items-center">
+                              {IconComponent && <IconComponent className="mr-2 h-5 w-5 text-primary" />}
+                              {prop.label} {prop.unit && `(${prop.unit})`}
+                            </FormLabel>
+                            {prop.type === 'number' ? (
+                              <>
+                                <div className="flex items-center gap-2">
+                                  <FormControl>
+                                    <Input
+                                      type="number"
+                                      step={prop.step}
+                                      min={prop.min}
+                                      max={prop.max}
+                                      value={numericValue ?? ''}
+                                      onChange={(e) => {
+                                        const val = e.target.value;
+                                        field.onChange(val === '' ? undefined : parseFloat(val));
+                                      }}
+                                      placeholder={(prop.defaultValue !== undefined) ? String(prop.defaultValue) : ''}
+                                      className="w-24"
+                                    />
+                                  </FormControl>
+                                  <Slider
+                                    min={prop.min}
+                                    max={prop.max}
+                                    step={prop.step}
+                                    value={!isNaN(numericValue) && numericValue !== undefined ? [numericValue] : undefined}
+                                    onValueChange={(value) => field.onChange(value[0])}
+                                    className="flex-1"
+                                  />
+                                </div>
+                              </>
+                            ) : (
+                              <FormControl>
+                                <Textarea
+                                  {...field}
+                                  value={(field.value as string) ?? ''}
+                                  placeholder={prop.description || `Enter ${prop.label}`}
+                                />
+                              </FormControl>
+                            )}
+                            <FormMessage />
+                          </FormItem>
+                        );
+                      }}
+                    />
+                  ))}
+                </CardContent>
+              </Card>
+
+              <CardFooter className="flex flex-col sm:flex-row justify-center items-center gap-4 pt-6">
+               
+                <Button type="submit" disabled={isLoading} size="lg" className="w-full md:w-auto text-lg px-8 py-6">
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                      Estimating...
+                    </>
+                  ) : (
+                    <>
+                      <BarChart3 className="mr-2 h-5 w-5" />
+                      Get Yield & Value Estimate
+                    </>
+                  )}
+                </Button>
+              </CardFooter>
+            </form>
+          </Form>
+        </CardContent>
+      </Card>
+
+      {estimationResult && (
+        <Card className="max-w-4xl mx-auto mt-8 shadow-xl">
+          <CardHeader>
+            <CardTitle className="text-2xl text-primary flex items-center">
+              <SelectedCropIcon className="mr-3 h-8 w-8" />
+              Estimated Yield & Value for {selectedCropLabel || 'Selected Crop'} ({currentPlotSize} acres)
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div>
+                <h3 className="font-semibold text-lg flex items-center mb-2">
+                  <Leaf className="mr-2 h-5 w-5 text-green-600" />
+                  Yield Estimation
+                </h3>
+                <p className="text-xl">
+                  Estimated Yield: <strong className="text-accent">{estimationResult.estimatedYield.toLocaleString()} kg</strong>
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Confidence Interval: {estimationResult.confidenceInterval.lower.toLocaleString()} kg - {estimationResult.confidenceInterval.upper.toLocaleString()} kg
+                </p>
+              </div>
+              <div>
+                <h3 className="font-semibold text-lg flex items-center mb-2">
+                   <DollarSign className="mr-2 h-5 w-5 text-yellow-500" />
+                   Market Value Estimation
+                </h3>
+                <p className="text-xl">
+                  Estimated Total Value: <strong className="text-accent">
+                    {estimationResult.estimatedTotalValue.toLocaleString()} {estimationResult.currency}
+                  </strong>
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Market Price: {estimationResult.marketPricePerKg.toLocaleString()} {estimationResult.currency} / {estimationResult.priceUnit}
+                </p>
+              </div>
+            </div>
+            
+            <div>
+              <h3 className="font-semibold text-lg flex items-center mb-2">
+                <Info className="mr-2 h-5 w-5 text-blue-500" />
+                Explanation
+              </h3>
+              <p className="text-muted-foreground italic bg-muted p-3 rounded-md">{estimationResult.explanation}</p>
+            </div>
+            
+            {estimationResult.suggestions && estimationResult.suggestions.length > 0 && (
+              <div>
+                <h3 className="font-semibold text-lg flex items-center mb-2">
+                  <Lightbulb className="mr-2 h-5 w-5 text-amber-500" />
+                  Soil Improvement Suggestions
+                </h3>
+                <ul className="space-y-2 list-disc list-inside bg-muted p-4 rounded-md text-muted-foreground">
+                  {estimationResult.suggestions.map((suggestion, index) => (
+                    <li key={index}>{suggestion}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+       <Dialog open={isSuggestionDialogOpen} onOpenChange={setIsSuggestionDialogOpen}>
+        <DialogContent className="sm:max-w-[625px]">
+          <DialogHeader>
+            <DialogTitle className="text-2xl flex items-center">
+              <Sparkles className="mr-2 h-6 w-6 text-primary" />
+              Suitable Crop Suggestions
+            </DialogTitle>
+            <DialogDescription>
+              Based on your soil and environmental data, here are a few recommended crops. Click one to use it in the estimator.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4 max-h-[60vh] overflow-y-auto">
+            {suggestions?.suggestions.map((suggestion, index) => (
+              <div key={index}>
+                <div className="flex justify-between items-start gap-4">
+                  <div>
+                    <h4 className="font-semibold text-lg">{suggestion.cropName}</h4>
+                    <p className="text-sm text-muted-foreground">{suggestion.reasoning}</p>
+                  </div>
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={() => {
+                      form.setValue('cropType', suggestion.cropName);
+                      setIsSuggestionDialogOpen(false);
+                      toast({
+                        title: 'Crop Type Updated!',
+                        description: `${suggestion.cropName} has been selected.`,
+                      });
+                    }}
+                  >
+                    Select
+                  </Button>
+                </div>
+                {index < suggestions.suggestions.length - 1 && <Separator className="mt-4" />}
+              </div>
+            ))}
+            {(!suggestions || suggestions.suggestions.length === 0) && (
+              <p className="text-center text-muted-foreground">The AI could not find any suitable crops for the provided conditions.</p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
