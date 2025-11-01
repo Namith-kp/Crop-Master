@@ -200,16 +200,18 @@ const estimateCropYieldFlow = ai.defineFlow(
 
     if (!aiOutput) {
       const rawText = llmResponse.text ?? "No raw text available from LLM.";
-      const firstCandidate = llmResponse.candidates?.[0];
-      const finishReason = firstCandidate?.finishReason ?? "Unknown";
-      const safetyRatings = firstCandidate?.safetyRatings ?? [];
+      // The typed response doesn't declare 'candidates', but some providers include it.
+      // Use a safe any-cast to avoid a TypeScript error while preserving debugging info.
+      const firstCandidate = (llmResponse as any).candidates?.[0];
+      const finishReason = firstCandidate?.finishReason ?? (llmResponse as any).finishReason ?? "Unknown";
+      const safetyRatings = firstCandidate?.safetyRatings ?? (llmResponse as any).safety?.ratings ?? [];
       
       console.error('LLM did not return valid structured output. Details:');
       console.error('  Raw text response from LLM:', rawText);
       console.error('  Finish reason:', finishReason);
       console.error('  Safety ratings:', JSON.stringify(safetyRatings, null, 2));
       console.error('  Input provided to LLM:', JSON.stringify(promptArgs, null, 2));
-      console.error('  Tool calls made by LLM (history):', JSON.stringify(llmResponse.history, null, 2));
+  console.error('  Tool calls made by LLM (history):', JSON.stringify((llmResponse as any).history, null, 2));
 
 
       let userMessage = 'The AI model did not return a valid estimation. Please check server logs for details.';
