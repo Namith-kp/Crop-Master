@@ -11,15 +11,41 @@ import { ArrowLeft, TrendingUp, Droplets, Sun, Calendar, DollarSign } from "luci
 import Link from "next/link";
 
 // Recharts imports
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-} from "recharts";
+import dynamic from "next/dynamic";
+
+// Dynamically load the Recharts chart as a client-only component to avoid
+// server-side imports that may access `window`/`document` during build/prerender.
+// This prevents prerender errors when Next tries to build the page.
+const Chart = dynamic(
+  async () => {
+    const recharts = await import("recharts");
+    const {
+      ResponsiveContainer,
+      BarChart,
+      Bar,
+      XAxis,
+      YAxis,
+      CartesianGrid,
+      Tooltip,
+    } = recharts as any;
+
+    // Return a default React component that renders the chart.
+    return function RechartsWrapper({ data }: { data: any[] }) {
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 20 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="name" />
+            <YAxis domain={[0, 100]} label={{ value: "Suitability %", angle: -90, position: "insideLeft" }} />
+            <Tooltip formatter={(value: number) => [`${value}%`, "Suitability"]} labelFormatter={(label: any) => `Crop: ${label}`} />
+            <Bar dataKey="suitability" fill="#22c55e" radius={[8, 8, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    };
+  },
+  { ssr: false }
+);
 
 type Crop = {
   N: number;
@@ -259,9 +285,8 @@ export default function CropResultPage() {
                     
                     {/* Progress bar */}
                     <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
-                      <div 
-                        className="bg-green-500 h-2 rounded-full transition-all duration-500"
-                        style={{ width: `${crop.suitability}%` }}
+                      <div
+                        className={`bg-green-500 h-2 rounded-full transition-all duration-500 w-[${crop.suitability}%]`}
                       ></div>
                     </div>
                     
@@ -280,18 +305,7 @@ export default function CropResultPage() {
                 <h3 className="text-lg font-semibold text-center mb-4 text-gray-700">
                   📊 Crop Suitability Comparison
                 </h3>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 20 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="name" />
-                    <YAxis domain={[0, 100]} label={{ value: 'Suitability %', angle: -90, position: 'insideLeft' }} />
-                    <Tooltip 
-                      formatter={(value: number) => [`${value}%`, 'Suitability']}
-                      labelFormatter={(label) => `Crop: ${label}`}
-                    />
-                    <Bar dataKey="suitability" fill="#22c55e" radius={[8, 8, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+                <Chart data={chartData} />
               </div>
             </>
           ) : (
